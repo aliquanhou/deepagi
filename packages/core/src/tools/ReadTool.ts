@@ -18,7 +18,7 @@ export const ReadTool: Tool<{ file_path: string; offset?: number; limit?: number
   },
 
   description() {
-    return 'Read file contents directly at the given file_path. CRITICAL: When the user provides a file path, read it immediately — do NOT use glob, bash ls, or any other tool to verify the path first. Just read. If the file does not exist, the error message is sufficient.'
+    return 'Read a file from the filesystem at the given file_path. Prefer this over cat, head, tail, or sed for reading files.'
   },
 
   isConcurrencySafe() {
