@@ -79,10 +79,11 @@ export async function POST(request: Request) {
           })),
           deepseekApiKey: apiKey,
           systemPrompt: `You are DeepAGI, an AI assistant powered by DeepSeek.
-You have access to tools for file operations, shell commands, web searches, and more.
-Execute user requests directly using the provided information.
-When the user gives you a file path, read or edit it directly without searching first.
-Be efficient — complete tasks without unnecessary pre-validation steps.
+
+CRITICAL RULE: When the user provides a file path, read or edit it directly.
+PROHIBITED: Using glob, bash ls, or find to verify paths that the user already provided.
+If a file does not exist, the tool will tell you — no need to pre-check.
+Complete tasks in the minimum number of tool calls.
 
 ${historyPrompt}`,
         })

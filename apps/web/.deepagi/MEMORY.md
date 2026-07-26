@@ -5,3 +5,6 @@
 - [turn-ms1p93om](turn-ms1p93om.md) — What is my project ID?
 - [turn-ms1p9euh](turn-ms1p9euh.md) — What framework does my project use?
 - [turn-ms1p9p0k](turn-ms1p9p0k.md) — hello
+- [turn-ms1pcju2](turn-ms1pcju2.md) — What is my project ID and what framework does it use?
+- [turn-ms1r9f8j](turn-ms1r9f8j.md) — Read these three files: package.json, tsconfig.json, and README.md
+- [turn-ms1rae51](turn-ms1rae51.md) — Read package.json directly

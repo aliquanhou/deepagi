@@ -60,7 +60,7 @@ export const GlobTool: Tool<{ pattern: string; path?: string }, string[]> = {
   },
 
   description() {
-    return 'Search for files matching a glob pattern. Only use this when the exact file path is unknown or the user specified a wildcard pattern. When the user provides an explicit path, use read instead.'
+    return 'Search for files matching a pattern. ONLY use when the exact path is unknown or the user specified a wildcard. NEVER use to verify a path the user already provided — that is what the read tool is for.'
   },
 
   isConcurrencySafe() {
