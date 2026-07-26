@@ -20,7 +20,11 @@ export type StreamChunk =
 export function useChat() {
   const store = useChatStore()
   const abortRef = useRef<AbortController | null>(null)
-  const accumulatedRef = useRef<string>('')
+  // Buffer text until we know whether tool calls exist
+  const textBufferRef = useRef<string>('')
+  const hasToolCallsRef = useRef(false)
+  // Track whether we've already flushed the initial text buffer
+  const flushedRef = useRef(false)
 
   const sendMessage = useCallback(async (content: string) => {
     let convId = store.activeConversationId
@@ -46,7 +50,9 @@ export function useChat() {
     })
     store.setStreaming(true)
     store.setError(null)
-    accumulatedRef.current = ''
+    textBufferRef.current = ''
+    hasToolCallsRef.current = false
+    flushedRef.current = false
 
     // Get conversation history
     const state = useChatStore.getState()
@@ -68,6 +74,14 @@ export function useChat() {
 
     const abortController = new AbortController()
     abortRef.current = abortController
+
+    /** Flush buffered text to the store (called when tool calls arrive or stream ends) */
+    const flushBuffer = () => {
+      if (textBufferRef.current && !flushedRef.current) {
+        flushedRef.current = true
+        store.updateLastAssistantContent(textBufferRef.current)
+      }
+    }
 
     try {
       const response = await fetch('/api/chat/stream', {
@@ -106,10 +120,19 @@ export function useChat() {
 
             switch (chunk.type) {
               case 'text_delta':
-                accumulatedRef.current += chunk.text
-                store.updateLastAssistantContent(accumulatedRef.current)
+                textBufferRef.current += chunk.text
+                // If we already have tool calls, flush text immediately after tool cards
+                if (hasToolCallsRef.current) {
+                  store.updateLastAssistantContent(textBufferRef.current)
+                  flushedRef.current = true
+                }
                 break
               case 'tool_use_start':
+                // First tool call? flush buffered text
+                if (!hasToolCallsRef.current) {
+                  hasToolCallsRef.current = true
+                  flushBuffer()
+                }
                 store.addToolCall({
                   id: chunk.id,
                   name: chunk.name,
@@ -132,6 +155,11 @@ export function useChat() {
             // Skip malformed JSON lines
           }
         }
+      }
+
+      // Flush any remaining text at the end of stream
+      if (textBufferRef.current && !flushedRef.current) {
+        store.updateLastAssistantContent(textBufferRef.current)
       }
     } catch (error: any) {
       if (error.name !== 'AbortError') {
