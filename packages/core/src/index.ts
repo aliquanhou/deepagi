@@ -1,7 +1,7 @@
 /**
  * DeepAGI Core Engine
  *
- * Core engine entry point. Re-exports all public API surface.
+ * Complete public API surface.
  */
 
 // Types
@@ -37,3 +37,15 @@ export * from './memory/index.js'
 
 // Skills
 export * from './skills/index.js'
+
+// Auth
+export * from './auth/index.js'
+
+// Persistence
+export * from './persistence/index.js'
+
+// Cost
+export * from './cost/index.js'
+
+// Multi-Agent
+export * from './agent/Coordinator.js'
