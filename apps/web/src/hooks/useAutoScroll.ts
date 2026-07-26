@@ -3,29 +3,40 @@
 import { useEffect, useRef } from 'react'
 import type { Message } from '@/store/chat'
 
-export function useAutoScroll(deps: Message[], isStreaming: boolean) {
+/**
+ * Auto-scroll to bottom whenever messages change.
+ * Always scrolls to the latest content.
+ */
+export function useAutoScroll(messages: Message[], _isStreaming: boolean) {
   const ref = useRef<HTMLDivElement>(null)
-  const shouldAutoScroll = useRef(true)
+  const userScrolledUp = useRef(false)
 
   useEffect(() => {
     const el = ref.current
     if (!el) return
 
     const handleScroll = () => {
-      const threshold = 100
-      shouldAutoScroll.current =
-        el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+      // User scrolled up if more than 150px from bottom
+      const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+      userScrolledUp.current = distFromBottom > 150
     }
 
-    el.addEventListener('scroll', handleScroll)
+    el.addEventListener('scroll', handleScroll, { passive: true })
     return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
   useEffect(() => {
-    if (shouldAutoScroll.current && ref.current) {
-      ref.current.scrollTop = ref.current.scrollHeight
+    if (!ref.current) return
+    // Always scroll to bottom when messages update (while streaming or not scrolled up)
+    if (!userScrolledUp.current) {
+      // Use requestAnimationFrame to ensure DOM has updated
+      requestAnimationFrame(() => {
+        if (ref.current) {
+          ref.current.scrollTop = ref.current.scrollHeight
+        }
+      })
     }
-  }, [deps])
+  }, [messages])
 
   return ref
 }
