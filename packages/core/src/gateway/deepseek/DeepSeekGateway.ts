@@ -1,13 +1,13 @@
 /**
  * DeepSeek LLM Gateway
  *
- * Ported from Open-ClaudeCode's claude.ts (LLM API client).
- * Equivalence rewrite: same streaming interface, OpenAI-compatible API format.
+ * Ported from Open-ClaudeCode's claude.ts.
+ * Equivalence rewrite: OpenAI-compatible Chat Completions API.
  *
- * DeepSeek uses OpenAI-compatible Chat Completions API:
- * - POST https://api.deepseek.com/v1/chat/completions
- * - stream: true for SSE
- * - tool_calls at message level
+ * Key rules:
+ * - tool role messages MUST immediately follow the assistant with matching tool_calls
+ * - Orphaned tool_results (no matching tool_calls in history) are dropped
+ * - Assistant content must be null when tool_calls are present
  */
 
 import type {
@@ -62,6 +62,8 @@ export class DeepSeekGateway {
       model: 'deepseek-v4-flash',
       ...config,
     }
+    if (!this.config.baseUrl) this.config.baseUrl = 'https://api.deepseek.com'
+    if (!this.config.model) this.config.model = 'deepseek-v4-flash'
   }
 
   get model(): string {
@@ -70,19 +72,17 @@ export class DeepSeekGateway {
 
   /**
    * Stream a chat completion from DeepSeek.
-   * Yields assistant messages and stream events.
    */
   async *stream(
     options: GatewayOptions,
   ): AsyncGenerator<SDKAssistantMessage | SDKStreamEvent> {
-    const openAIMessages = this.convertMessages(options.messages, options.systemPrompt)
+    const converted = this.convertMessagesSafe(options.messages, options.systemPrompt)
     const openAITools = this.convertTools(options.tools)
     const sessionId = crypto.randomUUID()
 
-    // Build request body
     const body: Record<string, unknown> = {
       model: options.model ?? this.config.model,
-      messages: openAIMessages,
+      messages: converted.messages,
       stream: true,
       stream_options: { include_usage: true },
     }
@@ -94,7 +94,6 @@ export class DeepSeekGateway {
     if (options.maxTokens) body.max_tokens = options.maxTokens
     if (options.temperature !== undefined) body.temperature = options.temperature
 
-    // Make API request
     const response = await fetch(`${this.config.baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
@@ -108,6 +107,13 @@ export class DeepSeekGateway {
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'unknown error')
+      // Log dropped tool results for debugging
+      if (converted.droppedToolIds.length > 0) {
+        throw new Error(
+          `DeepSeek API error ${response.status}: ${errorText}\n` +
+          `Dropped ${converted.droppedToolIds.length} orphaned tool_results (no matching tool_calls in history).`
+        )
+      }
       throw new Error(`DeepSeek API error ${response.status}: ${errorText}`)
     }
 
@@ -115,12 +121,12 @@ export class DeepSeekGateway {
     const reader = response.body!.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
-
-    // Track tool calls being built across chunks
     const pendingToolCalls = new Map<number, { id: string; name: string; arguments: string }>()
     let currentText = ''
     let stopReason: string | null = null
     let textBlockStarted = false
+    let contentBlocks: ContentBlock[] = []
+    let firstToolUseId: string | null = null
 
     try {
       while (true) {
@@ -165,7 +171,6 @@ export class DeepSeekGateway {
                 stopReason = finishReason === 'tool_calls' ? 'tool_use' : finishReason
               }
 
-              // Text content
               if (delta.content) {
                 if (!textBlockStarted) {
                   textBlockStarted = true
@@ -193,7 +198,6 @@ export class DeepSeekGateway {
                 }
               }
 
-              // Tool calls
               if (delta.tool_calls) {
                 for (const tc of delta.tool_calls) {
                   if (tc.id) {
@@ -230,7 +234,6 @@ export class DeepSeekGateway {
                 }
               }
 
-              // content_block_stop for text when tools start or message ends
               if (currentText && (delta.tool_calls || finishReason)) {
                 yield {
                   type: 'stream_event',
@@ -247,13 +250,11 @@ export class DeepSeekGateway {
         }
       }
 
-      // Build final assistant content blocks
-      const contentBlocks: ContentBlock[] = []
+      // Build final content blocks
       if (currentText) {
         contentBlocks.push({ type: 'text', text: currentText })
       }
 
-      let firstToolUseId: string | null = null
       for (const [, tc] of pendingToolCalls) {
         if (!firstToolUseId) firstToolUseId = tc.id
         let parsedInput: Record<string, unknown> = {}
@@ -295,14 +296,30 @@ export class DeepSeekGateway {
   }
 
   // ============================================================================
-  // Format Conversion
+  // Safe Message Conversion — validates tool pairing
   // ============================================================================
 
-  private convertMessages(messages: SDKMessage[], systemPrompt?: string): OpenAIMessage[] {
+  private convertMessagesSafe(
+    messages: SDKMessage[],
+    systemPrompt?: string,
+  ): { messages: OpenAIMessage[]; droppedToolIds: string[] } {
     const result: OpenAIMessage[] = []
+    const droppedToolIds: string[] = []
 
     if (systemPrompt) {
       result.push({ role: 'system', content: systemPrompt })
+    }
+
+    // Build set of all tool_call IDs from assistant messages
+    const allToolCallIds = new Set<string>()
+    for (const msg of messages) {
+      if (msg.type === 'assistant') {
+        for (const block of msg.message.content ?? []) {
+          if (block.type === 'tool_use') {
+            allToolCallIds.add(block.id)
+          }
+        }
+      }
     }
 
     for (const msg of messages) {
@@ -328,29 +345,37 @@ export class DeepSeekGateway {
           }
         }
 
+        // OpenAI rule: content must be null when tool_calls are present
         const assistantMsg: OpenAIMessage = {
           role: 'assistant',
-          content: textParts.length > 0 ? textParts.join('\n') : null,
+          content: toolCalls.length > 0 ? null : (textParts.join('\n') || null),
         }
         if (toolCalls.length > 0) {
           assistantMsg.tool_calls = toolCalls
         }
         result.push(assistantMsg)
+
       } else if (msg.type === 'user') {
-        // Extract tool results and text content
         const contentBlocks = Array.isArray(msg.message.content) ? msg.message.content : []
         const toolResults = contentBlocks.filter(
-          (b: ContentBlock): b is ContentBlock & { type: 'tool_result' } => b.type === 'tool_result',
+          (b): b is ContentBlock & { type: 'tool_result' } => b.type === 'tool_result',
         )
         const textBlocks = contentBlocks.filter(
-          (b: ContentBlock): b is ContentBlock & { type: 'text' } => b.type === 'text',
+          (b): b is ContentBlock & { type: 'text' } => b.type === 'text',
         )
 
         if (toolResults.length > 0) {
           for (const tr of toolResults) {
+            // DROP orphaned tool_results (no matching tool_call in history)
+            if (!allToolCallIds.has(tr.tool_use_id)) {
+              droppedToolIds.push(tr.tool_use_id)
+              continue
+            }
             result.push({
               role: 'tool',
-              content: tr.is_error ? `Error: ${tr.content}` : (typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content)),
+              content: tr.is_error
+                ? `Error: ${tr.content}`
+                : (typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content)),
               tool_call_id: tr.tool_use_id,
             })
           }
@@ -359,13 +384,19 @@ export class DeepSeekGateway {
         } else {
           result.push({
             role: 'user',
-            content: typeof msg.message.content === 'string' ? msg.message.content : JSON.stringify(msg.message.content),
+            content: typeof msg.message.content === 'string'
+              ? msg.message.content
+              : JSON.stringify(msg.message.content),
           })
         }
       }
     }
 
-    return result
+    return { messages: result, droppedToolIds }
+  }
+
+  private convertMessages(messages: SDKMessage[], systemPrompt?: string): OpenAIMessage[] {
+    return this.convertMessagesSafe(messages, systemPrompt).messages
   }
 
   private convertTools(tools: ToolDef[]): Array<{

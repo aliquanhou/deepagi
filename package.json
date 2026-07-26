@@ -1,7 +1,27 @@
 {
   "name": "deepagi",
+  "version": "0.1.0",
   "private": true,
-  "description": "DeepAGI - The best open-source agent powered by DeepSeek",
+  "description": "DeepAGI — Open-Source AI Agent Framework. Powered by DeepSeek. Lead: Dr. Yu Qiuhong.",
+  "keywords": [
+    "ai-agent",
+    "deepseek",
+    "llm",
+    "claude-code",
+    "opensource",
+    "agent-framework",
+    "typescript"
+  ],
+  "author": "Dr. Yu Qiuhong (于秋鸿博士) <yqiu@deepagi.ai>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/<your-org>/deepagi"
+  },
+  "bugs": {
+    "url": "https://github.com/<your-org>/deepagi/issues"
+  },
+  "homepage": "https://github.com/<your-org>/deepagi",
   "scripts": {
     "build": "turbo build",
     "dev": "turbo dev",
