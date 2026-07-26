@@ -15,11 +15,13 @@ export function MessageList() {
       <div className="flex-1 flex items-center justify-center">
         <div className="text-center space-y-4 max-w-md">
           <div className="text-4xl">🧠</div>
-          <h2 className="text-xl font-semibold">Welcome to DeepAGI</h2>
-          <p className="text-sm text-muted-foreground">
-            Your open-source AI agent powered by DeepSeek.
-            Ask me anything — I can help with code, files, research, and more.
+          <h2 className="text-xl font-semibold" style={{color:'#0f172a'}}>Welcome to DeepAGI</h2>
+          <p className="text-sm" style={{color:'#64748b'}}>
+            Your open-source AI agent. Ask me anything — I can help with code, files, research, and more.
           </p>
+          <div className="pt-4 text-xs" style={{color:'#94a3b8'}}>
+            🧠 DeepAGI · 首席架构师 于秋鸿博士
+          </div>
         </div>
       </div>
     )

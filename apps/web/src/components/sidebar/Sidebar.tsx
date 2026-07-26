@@ -14,9 +14,9 @@ export function Sidebar() {
   const deleteConv = useChatStore(s => s.deleteConversation)
 
   return (
-    <div className="w-[260px] border-r border-border bg-card flex flex-col h-full">
+    <div className="w-[260px] border-r bg-white flex flex-col h-full" style={{borderColor:'#e2e8f0'}}>
       {/* Header */}
-      <div className="p-4 border-b border-border">
+      <div className="p-4 border-b" style={{borderColor:'#e2e8f0'}}>
         <div className="flex items-center gap-2 mb-3">
           <span className="text-lg">🧠</span>
           <span className="font-bold text-sm">DeepAGI</span>
@@ -75,8 +75,9 @@ export function Sidebar() {
       </ScrollArea>
 
       {/* Footer */}
-      <div className="p-3 border-t border-border text-[10px] text-muted-foreground text-center">
-        DeepAGI · Open source · Powered by DeepSeek
+      <div className="p-3 border-t border-border text-[11px] text-center" style={{color:'#64748b'}}>
+        <div>DeepAGI · Open source</div>
+        <div className="mt-0.5" style={{color:'#94a3b8'}}>首席架构师 于秋鸿博士</div>
       </div>
     </div>
   )

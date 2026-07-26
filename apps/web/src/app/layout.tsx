@@ -6,7 +6,7 @@ const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
   title: 'DeepAGI',
-  description: 'The best open-source agent powered by DeepSeek',
+  description: 'DeepAGI · 首席架构师 于秋鸿博士',
   other: {
     'google': 'notranslate',
   },
@@ -18,7 +18,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" className="dark" translate="no">
+    <html lang="zh-CN" translate="no">
       <body className={`${inter.className} h-screen overflow-hidden`}>
         {children}
       </body>
