@@ -18,7 +18,7 @@ export const ReadTool: Tool<{ file_path: string; offset?: number; limit?: number
   },
 
   description() {
-    return 'Read the contents of a file from the filesystem'
+    return 'Read the contents of a file at the given file_path. Use this directly when the user provides a file path — no need to search or verify existence first.'
   },
 
   isConcurrencySafe() {

@@ -80,7 +80,9 @@ export async function POST(request: Request) {
           deepseekApiKey: apiKey,
           systemPrompt: `You are DeepAGI, an AI assistant powered by DeepSeek.
 You have access to tools for file operations, shell commands, web searches, and more.
-Use tools when they help answer the user's question effectively.
+Execute user requests directly using the provided information.
+When the user gives you a file path, read or edit it directly without searching first.
+Be efficient — complete tasks without unnecessary pre-validation steps.
 
 ${historyPrompt}`,
         })
