@@ -19,7 +19,7 @@ export * from './gateway/deepseek/DeepSeekGateway.js'
 export * from './engine/AgentEngine.js'
 export * from './engine/QueryPipeline.js'
 
-// Compression — import and re-export individual modules
+// Compression
 export { snipCompact } from './compression/snip.js'
 export { microcompact } from './compression/microcompact.js'
 export { contextCollapse } from './compression/collapse.js'
@@ -28,3 +28,12 @@ export { reactiveCompact } from './compression/reactiveCompact.js'
 export type { CollapseStore } from './compression/collapse.js'
 export { createCompressionPipeline } from './compression/index.js'
 export type { CompressionConfig, CompressionResult, SnipResult, CompactResult } from './compression/index.js'
+
+// Permission
+export * from './permission/index.js'
+
+// Memory
+export * from './memory/index.js'
+
+// Skills
+export * from './skills/index.js'
