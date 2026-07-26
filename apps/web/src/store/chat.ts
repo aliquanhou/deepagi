@@ -47,6 +47,8 @@ export type ChatState = {
   activeConversationId: string | null
   isStreaming: boolean
   error: string | null
+  totalTokens: number
+  totalCostUSD: number
 
   // Actions
   createConversation: () => string
@@ -59,6 +61,7 @@ export type ChatState = {
   setStreaming: (streaming: boolean) => void
   setError: (error: string | null) => void
   clearError: () => void
+  setUsage: (tokens: number, cost: number) => void
 }
 
 export const useChatStore = create<ChatState>()(
@@ -68,6 +71,8 @@ export const useChatStore = create<ChatState>()(
       activeConversationId: null,
       isStreaming: false,
       error: null,
+      totalTokens: 0,
+      totalCostUSD: 0,
 
       createConversation: () => {
         const id = generateId()
@@ -167,6 +172,7 @@ export const useChatStore = create<ChatState>()(
       setStreaming: (isStreaming) => set({ isStreaming }),
       setError: (error) => set({ error }),
       clearError: () => set({ error: null }),
+      setUsage: (tokens, cost) => set({ totalTokens: tokens, totalCostUSD: cost }),
     }),
     {
       name: 'deepagi-chat-storage',

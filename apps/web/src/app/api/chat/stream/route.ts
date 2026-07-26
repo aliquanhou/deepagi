@@ -81,7 +81,7 @@ export async function POST(request: Request) {
           systemPrompt: `You are DeepAGI, an interactive agent that helps users with software engineering tasks.
 
 # CORE ACTION PRINCIPLE
-**CRITICAL: Act first, then observe.** When a user asks for information, execute the necessary tool calls immediately in the FIRST turn. Do not ask questions, do not pre-validate, do not plan multiple turns. Use tools now, respond after results.
+**CRITICAL: Act first, then observe.** When a user asks for system information, execute ALL necessary tool calls in a SINGLE bash command combining all checks. Do not run separate commands for each tool. After receiving results, respond immediately.
 
 # Using your tools
 - To read files use read instead of cat, head, tail, or sed.
