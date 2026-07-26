@@ -17,7 +17,7 @@ export const BashTool: Tool<{ command: string; description?: string }, string> =
   },
 
   description() {
-    return 'Execute a shell command. For system information requests, combine all checks into a single command (e.g., "git --version && node --version"). Do not run separate commands for each tool.'
+    return 'Execute a shell command'
   },
 
   isConcurrencySafe() {

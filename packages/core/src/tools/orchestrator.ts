@@ -1,20 +1,16 @@
 /**
  * DeepAGI Tool Orchestrator
  *
- * Partitions tools by concurrency-safety.
- * Engine-level: detects consecutive bash calls and merges them with &&.
+ * Ported from Open-ClaudeCode's toolOrchestration.ts.
+ * Partitions tools by concurrency-safety, parallel for read-only, serial for writes.
+ * No engine-level enforcement — model-agnostic.
  */
 
 import { findToolByName, type Tool, type ToolResult } from './Tool.js'
 import type { ToolUseContext } from './ToolUseContext.js'
-import type { SDKMessage, SDKAssistantMessage, SDKUserMessage, ContentBlock } from '../types/index.js'
-
-// ============================================================================
-// Types
-// ============================================================================
+import type { SDKMessage, SDKAssistantMessage, SDKUserMessage } from '../types/index.js'
 
 export type ToolUseBlock = { id: string; name: string; input: Record<string, unknown> }
-
 export type MessageUpdate = { message?: SDKMessage; newContext: ToolUseContext }
 
 type MessageUpdateLazy = {
@@ -23,11 +19,10 @@ type MessageUpdateLazy = {
 }
 
 type Batch = { isConcurrencySafe: boolean; blocks: ToolUseBlock[] }
-
 const MAX_CONCURRENCY = 10
 
 // ============================================================================
-// Main Entry Point
+// Main
 // ============================================================================
 
 export async function* runTools(
@@ -36,15 +31,12 @@ export async function* runTools(
   toolUseContext: ToolUseContext,
 ): AsyncGenerator<MessageUpdate, void> {
   let currentContext = toolUseContext
-
   for (const { isConcurrencySafe, blocks } of partitionToolCalls(toolUseBlocks, currentContext)) {
     if (isConcurrencySafe) {
       const qcm: Record<string, Array<(ctx: ToolUseContext) => ToolUseContext>> = {}
       for await (const update of runToolsConcurrently(blocks, assistantMessages, currentContext)) {
         if (update.contextModifier) {
-          const { toolUseID, modifyContext } = update.contextModifier
-          if (!qcm[toolUseID]) qcm[toolUseID] = []
-          qcm[toolUseID].push(modifyContext)
+          (qcm[update.contextModifier.toolUseID] ??= []).push(update.contextModifier.modifyContext)
         }
         yield { message: update.message, newContext: currentContext }
       }
@@ -84,7 +76,7 @@ function safeCheck(tool: Tool, input: unknown): boolean {
 }
 
 // ============================================================================
-// Serial — with bash command merging
+// Serial
 // ============================================================================
 
 async function* runToolsSerially(
@@ -93,79 +85,14 @@ async function* runToolsSerially(
   toolUseContext: ToolUseContext,
 ): AsyncGenerator<MessageUpdate, void> {
   let currentContext = toolUseContext
-
-  // Merge consecutive bash commands
-  const merged = mergeConsecutiveBashCommands(toolUseBlocks)
-  const mergeMap = buildMergeMap(toolUseBlocks, merged)
-
-  for (const block of merged) {
-    const isMerged = block.name === '__bash_merged__'
-    const displayBlocks = isMerged ? (block as any).originalBlocks : [block]
-
-    // Mark all as in-progress
-    for (const db of displayBlocks) {
-      currentContext.setInProgressToolUseIDs(prev => new Set(prev).add(db.id))
-    }
-
-    for await (const update of executeTool(block, assistantMessages, currentContext)) {
-      if (update.contextModifier) {
-        currentContext = update.contextModifier.modifyContext(currentContext)
-      }
+  for (const toolUse of toolUseBlocks) {
+    toolUseContext.setInProgressToolUseIDs(prev => new Set(prev).add(toolUse.id))
+    for await (const update of executeTool(toolUse, assistantMessages, currentContext)) {
+      if (update.contextModifier) currentContext = update.contextModifier.modifyContext(currentContext)
       yield { message: update.message, newContext: currentContext }
     }
-
-    for (const db of displayBlocks) {
-      currentContext.setInProgressToolUseIDs(prev => {
-        const n = new Set(prev); n.delete(db.id); return n
-      })
-    }
+    toolUseContext.setInProgressToolUseIDs(prev => { const n = new Set(prev); n.delete(toolUse.id); return n })
   }
-}
-
-/**
- * Merge consecutive bash commands into a single combined command.
- * E.g. ["which python", "which node"] → "which python && which node"
- */
-function mergeConsecutiveBashCommands(blocks: ToolUseBlock[]): ToolUseBlock[] {
-  const result: ToolUseBlock[] = []
-  let i = 0
-  while (i < blocks.length) {
-    if (blocks[i]!.name === 'bash' && i + 1 < blocks.length && blocks[i + 1]!.name === 'bash') {
-      // Start a merge batch
-      const batch: ToolUseBlock[] = []
-      while (i < blocks.length && blocks[i]!.name === 'bash') {
-        batch.push(blocks[i]!)
-        i++
-      }
-      // Combine commands with &&
-      const combined = batch
-        .map(b => (b.input.command as string) || '')
-        .filter(Boolean)
-        .join(' && ')
-      result.push({
-        id: batch[0]!.id,
-        name: '__bash_merged__',
-        input: { command: combined, description: `Merged ${batch.length} commands` },
-        originalBlocks: batch,
-      } as any)
-    } else {
-      result.push(blocks[i]!)
-      i++
-    }
-  }
-  return result
-}
-
-function buildMergeMap(original: ToolUseBlock[], merged: ToolUseBlock[]): Map<string, string> {
-  const map = new Map<string, string>()
-  for (const m of merged) {
-    if ((m as any).originalBlocks) {
-      for (const ob of (m as any).originalBlocks as ToolUseBlock[]) {
-        map.set(ob.id, m.id)
-      }
-    }
-  }
-  return map
 }
 
 // ============================================================================
@@ -177,20 +104,16 @@ async function* runToolsConcurrently(
   assistantMessages: SDKAssistantMessage[],
   toolUseContext: ToolUseContext,
 ): AsyncGenerator<MessageUpdateLazy, void> {
-  const tasks = toolUseBlocks.map(toolUse => {
-    return async function* (): AsyncGenerator<MessageUpdateLazy, void> {
-      toolUseContext.setInProgressToolUseIDs(prev => new Set(prev).add(toolUse.id))
-      yield* executeTool(toolUse, assistantMessages, toolUseContext)
-      toolUseContext.setInProgressToolUseIDs(prev => {
-        const n = new Set(prev); n.delete(toolUse.id); return n
-      })
-    }
+  const tasks = toolUseBlocks.map(tu => async function* () {
+    toolUseContext.setInProgressToolUseIDs(prev => new Set(prev).add(tu.id))
+    yield* executeTool(tu, assistantMessages, toolUseContext)
+    toolUseContext.setInProgressToolUseIDs(prev => { const n = new Set(prev); n.delete(tu.id); return n })
   })
   yield* runAll(tasks, MAX_CONCURRENCY)
 }
 
 // ============================================================================
-// Single Tool Execution
+// Execute
 // ============================================================================
 
 async function* executeTool(
@@ -198,34 +121,22 @@ async function* executeTool(
   _assistantMessages: SDKAssistantMessage[],
   toolUseContext: ToolUseContext,
 ): AsyncGenerator<MessageUpdateLazy, void> {
-  const toolName = toolUse.name === '__bash_merged__' ? 'bash' : toolUse.name
-  const tool = findToolByName(toolUseContext.options.tools, toolName)
-  if (!tool) {
-    yield { message: makeToolError(toolUse.id, `Unknown tool: ${toolName}`) }
-    return
-  }
-
+  const tool = findToolByName(toolUseContext.options.tools, toolUse.name)
+  if (!tool) { yield { message: makeToolError(toolUse.id, `Unknown tool: ${toolUse.name}`) }; return }
   if (tool.validateInput) {
     const v = await tool.validateInput(toolUse.input, toolUseContext)
     if (!v.result) { yield { message: makeToolError(toolUse.id, v.message) }; return }
   }
-
   try {
     const result = await tool.call(toolUse.input, toolUseContext)
     yield {
       message: makeToolResult(toolUse.id, result),
-      contextModifier: result.contextModifier
-        ? { toolUseID: toolUse.id, modifyContext: result.contextModifier }
-        : undefined,
+      contextModifier: result.contextModifier ? { toolUseID: toolUse.id, modifyContext: result.contextModifier } : undefined,
     }
   } catch (error: unknown) {
     yield { message: makeToolError(toolUse.id, error instanceof Error ? error.message : String(error)) }
   }
 }
-
-// ============================================================================
-// Helpers
-// ============================================================================
 
 function makeToolResult(toolUseId: string, result: ToolResult<unknown>): SDKUserMessage {
   const content = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2)
@@ -237,7 +148,7 @@ function makeToolError(toolUseId: string, error: string): SDKUserMessage {
 }
 
 // ============================================================================
-// Concurrency Helper
+// Concurrency
 // ============================================================================
 
 async function* runAll(
@@ -245,27 +156,16 @@ async function* runAll(
   concurrency: number,
 ): AsyncGenerator<MessageUpdateLazy, void> {
   const buffer: MessageUpdateLazy[] = []
-  let done = false
-
-  async function runner(gen: () => AsyncGenerator<MessageUpdateLazy, void>): Promise<void> {
-    for await (const val of gen()) {
-      buffer.push(val)
-    }
-  }
-
   const running = new Set<Promise<void>>()
   let i = 0
+  const runner = async (gen: () => AsyncGenerator<MessageUpdateLazy, void>) => { for await (const v of gen()) buffer.push(v) }
   for (; i < Math.min(concurrency, generators.length); i++) running.add(runner(generators[i]!))
   for (; i < generators.length; i++) {
     await Promise.race(running)
-    for (const p of running) {
-      if (await Promise.race([p.then(() => true), Promise.resolve(false)])) { running.delete(p); break }
-    }
+    for (const p of running) { if (await Promise.race([p.then(() => true), Promise.resolve(false)])) { running.delete(p); break } }
     running.add(runner(generators[i]!))
   }
   await Promise.all(running)
-  done = true
-
   while (buffer.length > 0) yield buffer.shift()!
 }
 

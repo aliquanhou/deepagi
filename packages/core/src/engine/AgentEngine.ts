@@ -1,11 +1,9 @@
 /**
  * DeepAGI AgentEngine
  *
- * 5-phase submitMessage lifecycle with:
- * - Tool call caching (same tool+args → cached result)
- * - Report caching (same prompt → cached report)
- * - Memory retrieval & auto-update
- * - QueryPipeline state machine + tool execution
+ * 5-phase submitMessage lifecycle.
+ * System prompt adapted from Claude Code's verified structure.
+ * Pure hybrid: DeepSeek API + Claude-style prompts + agnostic tooling.
  */
 
 import type {
@@ -29,10 +27,6 @@ export class AgentEngine {
   private sessionId: string
   private memoryEnabled: boolean
   private turnCount = 0
-  /** Cache: "toolName:argsJSON" → tool result messages */
-  private toolCallCache = new Map<string, SDKMessage[]>()
-  /** Cache: normalized prompt → final text result */
-  private reportCache = new Map<string, string>()
 
   constructor(config: EngineConfig) {
     this.config = config
@@ -54,31 +48,15 @@ export class AgentEngine {
     this.turnCount++
     let lastStopReason: string | null = null
 
-    // Report cache check: normalize prompt for matching
-    const cacheKey = prompt.toLowerCase().replace(/\s+/g, ' ').trim()
-    const cached = this.reportCache.get(cacheKey)
-    if (cached) {
-      yield {
-        type: 'result', subtype: 'success', is_error: false, result: cached,
-        stop_reason: 'end_turn', duration_ms: 0, num_turns: 0,
-        total_cost_usd: 0, usage: this.totalUsage,
-        session_id: crypto.randomUUID(), uuid: crypto.randomUUID(),
-      } as SDKMessage
-      return
-    }
-
-    // Phase 1-2: User input
     this.mutableMessages.push({
       type: 'user', message: { role: 'user', content: prompt },
       parent_tool_use_id: null, uuid: options?.uuid ?? crypto.randomUUID(),
       timestamp: new Date().toISOString(),
     })
 
-    // Phase 3: System prompt
     const systemPrompt = this.config.systemPrompt ?? this.getDefaultSystemPrompt()
     let finalAssistantText = ''
 
-    // Phase 4: Query loop
     while (true) {
       const pipeline = new QueryPipeline({
         gateway: this.gateway, tools: this.toolDefs, systemPrompt,
@@ -95,25 +73,19 @@ export class AgentEngine {
           )
           finalAssistantText += textBlocks.map(t => t.text).join('')
           yield message
-        } else {
-          yield message
-        }
+        } else yield message
       }
 
       const lastAssistant = this.findLastAssistant()
       if (!lastAssistant) break
-
       const toolUses = (lastAssistant.message.content ?? []).filter(
         (c): c is ContentBlock & { type: 'tool_use' } => c.type === 'tool_use',
       )
       if (toolUses.length === 0) break
 
-      // Execute tools with caching
       this.turnCount++
-      const toolResults = await this.executeToolBatchWithCache(toolUses, lastAssistant)
-      for (const tr of toolResults) {
-        this.mutableMessages.push(tr)
-      }
+      const toolResults = await this.executeToolBatch(toolUses, lastAssistant)
+      for (const tr of toolResults) this.mutableMessages.push(tr)
 
       if (this.config.maxTurns && this.turnCount > this.config.maxTurns) {
         yield { type: 'result', subtype: 'error_max_turns', is_error: true,
@@ -125,17 +97,10 @@ export class AgentEngine {
       }
     }
 
-    // Cache the final report
-    if (finalAssistantText.trim()) {
-      this.reportCache.set(cacheKey, finalAssistantText.trim())
-    }
-
-    // Auto-store memory
     if (this.memoryEnabled && finalAssistantText.trim()) {
       try { storeMemory(createTurnMemory(this.sessionId, prompt, finalAssistantText)) } catch {}
     }
 
-    // Phase 5: Result
     const lastMsg = this.findLastAssistant()
     let textResult = ''
     if (lastMsg) {
@@ -148,105 +113,85 @@ export class AgentEngine {
       session_id: crypto.randomUUID(), uuid: crypto.randomUUID() } as SDKMessage
   }
 
-  /** Execute tools with caching: same tool+args returns cached result */
-  private async executeToolBatchWithCache(
+  private async executeToolBatch(
     toolUses: Array<ContentBlock & { type: 'tool_use' }>,
     _parentMessage: SDKAssistantMessage,
   ): Promise<SDKMessage[]> {
     const results: SDKMessage[] = []
-
     for (const block of toolUses) {
-      const cacheKey = `${block.name}:${JSON.stringify(block.input)}`
-      const cached = this.toolCallCache.get(cacheKey)
-      if (cached) {
-        results.push(...cached)
-        continue
-      }
-
       const tool = this.tools.find(t => t.name === block.name)
-      if (!tool) {
-        results.push(this.makeToolResult(block.id, `Unknown tool: ${block.name}`, true))
-        continue
-      }
+      if (!tool) { results.push(this.makeToolResult(block.id, `Unknown tool: ${block.name}`, true)); continue }
 
       const context: ToolUseContext = {
         options: { tools: this.tools, mainLoopModel: this.gateway.model, verbose: this.config.verbose ?? false },
         abortController: this.abortController, messages: this.mutableMessages,
         inProgressToolUseIDs: new Set(), setInProgressToolUseIDs: () => {},
       }
-
       try {
         if (tool.validateInput) {
-          const validation = await tool.validateInput(block.input, context)
-          if (!validation.result) {
-            results.push(this.makeToolResult(block.id, validation.message, true))
-            continue
-          }
+          const v = await tool.validateInput(block.input, context)
+          if (!v.result) { results.push(this.makeToolResult(block.id, v.message, true)); continue }
         }
         const result = await tool.call(block.input, context)
         const content = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2)
-        const toolMsg = this.makeToolResult(block.id, content)
-        // Cache the result
-        this.toolCallCache.set(cacheKey, [toolMsg])
-        results.push(toolMsg)
+        results.push(this.makeToolResult(block.id, content))
       } catch (error: unknown) {
-        const msg = error instanceof Error ? error.message : String(error)
-        results.push(this.makeToolResult(block.id, msg, true))
+        results.push(this.makeToolResult(block.id, error instanceof Error ? error.message : String(error), true))
       }
     }
     return results
   }
 
   private makeToolResult(toolUseId: string, content: string, isError = false): SDKUserMessage {
-    return {
-      type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content, is_error: isError }] },
-      parent_tool_use_id: toolUseId, uuid: crypto.randomUUID(),
-    }
+    return { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content, is_error: isError }] }, parent_tool_use_id: toolUseId, uuid: crypto.randomUUID() }
   }
 
   private findLastAssistant(): SDKAssistantMessage | undefined {
     for (let i = this.mutableMessages.length - 1; i >= 0; i--) {
       if (this.mutableMessages[i]!.type === 'assistant') return this.mutableMessages[i] as SDKAssistantMessage
     }
-    return undefined
   }
 
   interrupt(): void { this.abortController.abort() }
   getMessages(): readonly SDKMessage[] { return this.mutableMessages }
 
   private getDefaultSystemPrompt(): string {
-    return `You are DeepAGI, an interactive agent that helps users with software engineering tasks.
+    return `You are DeepAGI, an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
 
-# CORE ACTION PRINCIPLE
-
-**CRITICAL: Act first, then observe.**
-
-- When a user asks for system information (e.g., "report my toolchain"), execute ALL necessary tool calls in the FIRST turn.
-- Use a SINGLE bash command combining all checks: e.g., "git --version && node --version && python --version".
-- Do NOT run separate commands for each tool. Do NOT re-check tools already verified.
-- After receiving tool results, formulate your final response immediately.
+IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
 
 # System
-- All text you output outside of tool use is displayed to the user.
+- All text you output outside of tool use is displayed to the user. You can use Github-flavored markdown for formatting.
 - Tools are run in a permission mode. If a tool call is denied, adjust your approach.
-- The system automatically compresses prior messages as context limits approach.
+- The system will automatically compress prior messages as it approaches context limits.
 
 # Doing tasks
-- The user will ask you to perform software engineering tasks: fixing bugs, adding features, refactoring, explaining code.
-- You are highly capable. Defer to user judgment.
-- Do not propose changes to code you haven't read first.
-- Don't add features or make improvements beyond what was asked.
-- Prioritize writing safe, secure, and correct code.
+- The user will primarily ask you to perform software engineering tasks: fixing bugs, adding features, refactoring, explaining code, and more.
+- You are highly capable. Defer to user judgment about whether a task is too large.
+- Do not propose changes to code you haven't read first. If a user asks about or wants you to modify a file, read it first.
+- Don't add features, refactor, or make improvements beyond what was asked.
+- If an approach fails, diagnose why before switching tactics. Prioritize writing safe, secure, and correct code.
+- Avoid creating helpers or abstractions for one-time operations. Three similar lines of code is better than a premature abstraction.
 
 # Using your tools
 - To read files use read instead of cat, head, tail, or sed
 - To edit files use edit instead of sed or awk
-- To create files use write instead of cat with heredoc
+- To create files use write instead of cat with heredoc or echo redirection
 - To search for files use glob instead of find or ls
+- To search file contents use grep instead of grep or rg
+- Prefer dedicated tools over bash for file operations.
+
+# Executing actions with care
+- Before deleting or overwriting, check what you're replacing. If what you find contradicts how it was described, surface that instead of proceeding.
+- Destructive operations warrant user confirmation: removing files, overwriting uncommitted changes, and other irreversible actions.
 
 # Tone and style
 - Do not use emojis unless the user explicitly requests it.
-- Be short and concise. Go straight to the point.
-- Lead with the answer or action, not the reasoning.`
+- Your responses should be short and concise.
+- When referencing specific functions or pieces of code include pattern file_path:line_number.
+
+# Output efficiency
+- Go straight to the point. Try the simplest approach first. Be extra concise.
+- Lead with the answer or action, not the reasoning. Skip filler words and unnecessary transitions.`
   }
 }

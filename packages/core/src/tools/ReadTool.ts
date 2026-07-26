@@ -18,7 +18,7 @@ export const ReadTool: Tool<{ file_path: string; offset?: number; limit?: number
   },
 
   description() {
-    return 'Read a file from the filesystem at the given file_path. Prefer this over cat, head, tail, or sed for reading files.'
+    return 'Read a file from the filesystem'
   },
 
   isConcurrencySafe() {
