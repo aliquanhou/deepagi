@@ -2,11 +2,20 @@
  * DeepAGI QueryPipeline
  *
  * Ported from Open-ClaudeCode's query.ts state machine.
- * while(true) + state = next loop with API streaming, error recovery, and tool_use detection.
+ * while(true) + state = next loop with:
+ * - 5-layer compression (Snip → Micro → Collapse → Auto → Reactive)
+ * - API streaming via DeepSeekGateway
+ * - Error recovery
+ * - Tool_use detection / agent delegation
  */
 
 import type { SDKMessage, SDKAssistantMessage, SDKStreamEvent, ToolDef } from '../types/index.js'
 import { DeepSeekGateway } from '../gateway/deepseek/DeepSeekGateway.js'
+import { snipCompact } from '../compression/snip.js'
+import { microcompact } from '../compression/microcompact.js'
+import { contextCollapse } from '../compression/collapse.js'
+import { autoCompact } from '../compression/autocompact.js'
+import { reactiveCompact } from '../compression/reactiveCompact.js'
 
 // ============================================================================
 // Types
@@ -20,6 +29,9 @@ export type State = {
   turnCount: number
   transition: Continue | undefined
   maxOutputTokensRecoveryCount: number
+  hasAttemptedReactiveCompact: boolean
+  snipApplied: boolean
+  autoCompactApplied: boolean
 }
 
 export type PipelineConfig = {
@@ -29,6 +41,11 @@ export type PipelineConfig = {
   maxTurns?: number
   signal: AbortSignal
   model?: string
+  // Compression config
+  maxMessagesBeforeCompact?: number
+  snipKeepLast?: number
+  autoCompactEnabled?: boolean
+  collapseEnabled?: boolean
 }
 
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
@@ -41,12 +58,17 @@ export class QueryPipeline {
   private config: PipelineConfig
 
   constructor(config: PipelineConfig) {
-    this.config = config
+    this.config = {
+      maxMessagesBeforeCompact: 40,
+      snipKeepLast: 15,
+      autoCompactEnabled: true,
+      collapseEnabled: true,
+      ...config,
+    }
   }
 
   /**
-   * Run the query loop.
-   * while(true) + state = next — ported from query.ts queryLoop().
+   * Run the query loop with compression + error recovery.
    */
   async *run(params: {
     messages: SDKMessage[]
@@ -57,12 +79,50 @@ export class QueryPipeline {
       turnCount: params.turnCount,
       transition: undefined,
       maxOutputTokensRecoveryCount: 0,
+      hasAttemptedReactiveCompact: false,
+      snipApplied: false,
+      autoCompactApplied: false,
     }
 
     while (true) {
       const { messages, turnCount } = state
 
-      // Step 1: API call via DeepSeek
+      // =====================================================================
+      // Stage 1: Compression pipeline (5 layers)
+      // =====================================================================
+      let compressedMessages = messages
+
+      // Layer 1: Snip — truncate if too long
+      if (!state.snipApplied) {
+        const snipResult = snipCompact(compressedMessages, this.config.snipKeepLast)
+        if (snipResult.tokensFreed > 0) {
+          compressedMessages = snipResult.messages
+          state = { ...state, snipApplied: true }
+        }
+      }
+
+      // Layer 2: Microcompact — trim verbose tool results
+      const microResult = microcompact(compressedMessages)
+      compressedMessages = microResult.messages
+
+      // Layer 3: Context Collapse — fold distant segments
+      if (this.config.collapseEnabled) {
+        const collapseResult = contextCollapse(compressedMessages, true)
+        compressedMessages = collapseResult.messages
+      }
+
+      // Layer 4: AutoCompact — summarize oldest messages
+      if (this.config.autoCompactEnabled && !state.autoCompactApplied) {
+        const autoResult = await autoCompact(compressedMessages, true)
+        if (autoResult.compacted) {
+          compressedMessages = autoResult.messages
+          state = { ...state, autoCompactApplied: true }
+        }
+      }
+
+      // =====================================================================
+      // Stage 2: API call via DeepSeek
+      // =====================================================================
       const assistantMessages: SDKAssistantMessage[] = []
       let hasToolUse = false
       let lastStopReason: string | null = null
@@ -70,7 +130,7 @@ export class QueryPipeline {
 
       try {
         for await (const message of this.config.gateway.stream({
-          messages,
+          messages: compressedMessages,
           tools: this.config.tools,
           systemPrompt: this.config.systemPrompt,
           signal: this.config.signal,
@@ -81,12 +141,8 @@ export class QueryPipeline {
             const toolBlocks = (message.message.content ?? []).filter(
               (c: Record<string, unknown>) => c.type === 'tool_use',
             )
-            if (toolBlocks.length > 0) {
-              hasToolUse = true
-            }
-            if (message.message.stop_reason) {
-              lastStopReason = message.message.stop_reason
-            }
+            if (toolBlocks.length > 0) hasToolUse = true
+            if (message.message.stop_reason) lastStopReason = message.message.stop_reason
             yield message
           } else {
             yield message
@@ -96,8 +152,25 @@ export class QueryPipeline {
         apiError = error instanceof Error ? error.message : String(error)
       }
 
-      // Step 2: Handle API error
+      // =====================================================================
+      // Stage 3: Error recovery
+      // =====================================================================
       if (apiError) {
+        // Layer 5: ReactiveCompact — attempt recovery for prompt_too_long
+        if (!state.hasAttemptedReactiveCompact) {
+          const reactiveResult = await reactiveCompact(compressedMessages, apiError)
+          if (reactiveResult.compacted) {
+            state = {
+              ...state,
+              messages: reactiveResult.messages,
+              hasAttemptedReactiveCompact: true,
+              transition: { reason: 'reactive_compact_retry' },
+            }
+            continue
+          }
+        }
+
+        // Yield error and terminate
         yield {
           type: 'assistant',
           message: {
@@ -112,30 +185,31 @@ export class QueryPipeline {
         return { reason: 'model_error', error: apiError }
       }
 
-      // Step 3: Terminal? No tool_use → done
+      // =====================================================================
+      // Stage 4: Terminal? No tool_use → done
+      // =====================================================================
       if (!hasToolUse) {
         return { reason: 'completed' }
       }
 
-      // Step 4: max_output_tokens recovery
+      // =====================================================================
+      // Stage 5: max_output_tokens recovery
+      // =====================================================================
       const lastAssistant = assistantMessages.at(-1)
       if (lastAssistant?.error === 'max_output_tokens') {
         if (state.maxOutputTokensRecoveryCount < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT) {
           state = {
+            ...state,
             messages: [
-              ...messages,
+              ...compressedMessages,
               ...assistantMessages,
               {
                 type: 'user',
-                message: {
-                  role: 'user',
-                  content: 'Continue from where you left off. Break remaining work into smaller pieces.',
-                },
+                message: { role: 'user', content: 'Continue from where you left off.' },
                 parent_tool_use_id: null,
                 uuid: crypto.randomUUID(),
               },
             ],
-            turnCount,
             transition: { reason: 'max_output_tokens_recovery', attempt: state.maxOutputTokensRecoveryCount + 1 },
             maxOutputTokensRecoveryCount: state.maxOutputTokensRecoveryCount + 1,
           }
@@ -143,7 +217,9 @@ export class QueryPipeline {
         }
       }
 
-      // Step 5: Max turns check
+      // =====================================================================
+      // Stage 6: Max turns check
+      // =====================================================================
       const nextTurnCount = turnCount + 1
       if (this.config.maxTurns && nextTurnCount > this.config.maxTurns) {
         yield {
@@ -160,7 +236,9 @@ export class QueryPipeline {
         return { reason: 'max_turns' }
       }
 
-      // Step 6: Signal tool_use — caller (AgentEngine) handles execution
+      // =====================================================================
+      // Stage 7: Signal tool_use — caller (AgentEngine) handles execution
+      // =====================================================================
       return { reason: 'tool_use' }
     }
   }

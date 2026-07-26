@@ -18,3 +18,13 @@ export * from './gateway/deepseek/DeepSeekGateway.js'
 // Engine
 export * from './engine/AgentEngine.js'
 export * from './engine/QueryPipeline.js'
+
+// Compression — import and re-export individual modules
+export { snipCompact } from './compression/snip.js'
+export { microcompact } from './compression/microcompact.js'
+export { contextCollapse } from './compression/collapse.js'
+export { autoCompact } from './compression/autocompact.js'
+export { reactiveCompact } from './compression/reactiveCompact.js'
+export type { CollapseStore } from './compression/collapse.js'
+export { createCompressionPipeline } from './compression/index.js'
+export type { CompressionConfig, CompressionResult, SnipResult, CompactResult } from './compression/index.js'
