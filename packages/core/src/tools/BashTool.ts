@@ -17,7 +17,7 @@ export const BashTool: Tool<{ command: string; description?: string }, string> =
   },
 
   description() {
-    return 'Execute shell commands in the system shell'
+    return 'Execute a shell command. Use this to get any system information in a single call. Combine multiple checks with &&.'
   },
 
   isConcurrencySafe() {
