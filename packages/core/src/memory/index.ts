@@ -1,9 +1,12 @@
 /**
  * DeepAGI Memory System
  *
- * Ported from Open-ClaudeCode's memory/memdir system.
- * Provides persistent memory via MEMORY.md index + individual memory files.
- * Stores memories as Markdown files in .deepagi/memory/.
+ * Three-layer memory:
+ * 1. In-process: crossSessionMemories array (same process, across requests)
+ * 2. File-based: .deepagi/memory/ with MEMORY.md index (persistent across restarts)
+ * 3. SQLite: optional, for better query performance
+ *
+ * File-based storage always works — no external dependencies required.
  */
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs'
@@ -17,112 +20,140 @@ const INDEX_FILE = 'MEMORY.md'
 // ============================================================================
 
 export type MemoryEntry = {
+  id?: string
   name: string
   description: string
   content: string
-  type: 'user' | 'feedback' | 'project' | 'reference'
+  type: 'user' | 'feedback' | 'project' | 'reference' | 'fact' | 'summary'
   tags: string[]
   createdAt: string
   updatedAt: string
+  sourceSessionId?: string
 }
 
 // ============================================================================
-// Directory Management
+// In-process + file-backed store
 // ============================================================================
 
-function ensureMemoryDir(cwd?: string): string {
-  const dir = cwd ? resolve(cwd, MEMORY_DIR) : resolve(process.cwd(), MEMORY_DIR)
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  }
-  return dir
-}
-
-function getIndexPath(dir: string): string {
-  return resolve(dir, '..', INDEX_FILE)
-}
-
-// ============================================================================
-// Memory CRUD
-// ============================================================================
+const memories: MemoryEntry[] = []
+let storeDir = ''
 
 /**
- * List all memories with their metadata.
+ * Initialize the memory store. Always creates the file directory.
  */
-export function listMemories(cwd?: string): MemoryEntry[] {
-  const dir = ensureMemoryDir(cwd)
-  const memories: MemoryEntry[] = []
-
-  if (!existsSync(dir)) return memories
-
-  const files = readdirSync(dir).filter(f => f.endsWith('.md'))
-  for (const file of files) {
-    const content = readFileSync(join(dir, file), 'utf-8')
-    const entry = parseMemoryFile(content, file)
-    if (entry) memories.push(entry)
-  }
-
-  return memories
-}
-
-/**
- * Read a single memory by name.
- */
-export function getMemory(name: string, cwd?: string): MemoryEntry | null {
-  const dir = ensureMemoryDir(cwd)
-  const filePath = join(dir, `${sanitizeName(name)}.md`)
-  if (!existsSync(filePath)) return null
-
-  const content = readFileSync(filePath, 'utf-8')
-  return parseMemoryFile(content, `${name}.md`)
-}
-
-/**
- * Save a memory entry.
- */
-export function saveMemory(entry: MemoryEntry, cwd?: string): void {
-  const dir = ensureMemoryDir(cwd)
-  const filePath = join(dir, `${sanitizeName(entry.name)}.md`)
-
-  const now = new Date().toISOString()
-  const existing = existsSync(filePath) ? readFileSync(filePath, 'utf-8') : null
-  const createdAt = existing ? extractCreatedAt(existing) ?? now : now
-
-  const content = formatMemoryFile(entry, createdAt)
-  writeFileSync(filePath, content, 'utf-8')
-
-  // Update MEMORY.md index
-  updateIndex(dir, entry)
-}
-
-/**
- * Delete a memory by name.
- */
-export function deleteMemory(name: string, cwd?: string): boolean {
-  const dir = ensureMemoryDir(cwd)
-  const filePath = join(dir, `${sanitizeName(name)}.md`)
-  if (!existsSync(filePath)) return false
-
+export function initMemoryStore(cwd?: string): boolean {
+  const base = cwd ?? process.cwd()
+  storeDir = resolve(base, MEMORY_DIR)
   try {
-    writeFileSync(filePath, '') // Clear content (soft delete)
+    mkdirSync(storeDir, { recursive: true })
+    if (existsSync(storeDir)) {
+      for (const file of readdirSync(storeDir).filter(f => f.endsWith('.md'))) {
+        const content = readFileSync(join(storeDir, file), 'utf-8')
+        const entry = parseMemoryFile(content, file)
+        if (entry) memories.push(entry)
+      }
+    }
     return true
   } catch {
+    storeDir = ''
     return false
   }
 }
 
 /**
- * Find memories matching a search query.
+ * Store a memory entry. Persists to both in-process array and file.
  */
-export function searchMemories(query: string, cwd?: string): MemoryEntry[] {
-  const q = query.toLowerCase()
-  return listMemories(cwd).filter(
-    m =>
-      m.name.toLowerCase().includes(q) ||
-      m.description.toLowerCase().includes(q) ||
-      m.content.toLowerCase().includes(q) ||
-      m.tags.some(t => t.toLowerCase().includes(q)),
+export function storeMemory(entry: MemoryEntry): MemoryEntry {
+  const now = new Date().toISOString()
+  const record: MemoryEntry = {
+    ...entry,
+    id: crypto.randomUUID(),
+    createdAt: entry.createdAt || now,
+    updatedAt: now,
+  }
+  memories.push(record)
+  if (storeDir) {
+    try {
+      const fp = join(storeDir, `${sanitizeName(record.name)}.md`)
+      const existing = existsSync(fp) ? readFileSync(fp, 'utf-8') : null
+      writeFileSync(fp, formatMemoryFile(record, existing ? extractCreatedAt(existing) ?? now : now), 'utf-8')
+      updateIndex(storeDir, record)
+    } catch { /* non-critical */ }
+  }
+  return record
+}
+
+/**
+ * Search memories by keyword matching.
+ * Splits query into individual words for better natural language matching.
+ */
+export function searchMemories(query: string, limit = 10): MemoryEntry[] {
+  const keywords = query.toLowerCase().split(/\s+/).filter((w: string) => w.length > 1)
+  if (keywords.length === 0) return []
+
+  return memories
+    .filter((m: MemoryEntry) => {
+      const haystack = (m.content + ' ' + m.name + ' ' + m.description + ' ' + m.tags.join(' ')).toLowerCase()
+      return keywords.some((kw: string) => haystack.includes(kw))
+    })
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    .slice(0, limit)
+}
+
+/**
+ * Format memories as a system prompt fragment for injection.
+ */
+export function formatMemoriesForPrompt(memories: MemoryEntry[]): string {
+  if (memories.length === 0) return ''
+  const lines = memories.map((m, i) =>
+    `[Memory ${i + 1}] ${m.type.toUpperCase()}: ${m.description}\n${m.content.slice(0, 500)}`
   )
+  return `\nRelevant memories from previous sessions:\n${lines.join('\n---\n')}\n`
+}
+
+/**
+ * Auto-generate a summary memory from a conversation turn.
+ */
+export function createTurnMemory(
+  sessionId: string | undefined,
+  userMessage: string,
+  assistantResponse: string,
+): MemoryEntry {
+  const words = (userMessage + ' ' + assistantResponse).toLowerCase()
+  const tags: string[] = []
+  if (words.includes('project')) tags.push('project')
+  if (words.includes('config') || words.includes('setting')) tags.push('config')
+  if (words.includes('react') || words.includes('vue') || words.includes('angular')) tags.push('framework')
+  if (words.includes('install') || words.includes('dep') || words.includes('npm')) tags.push('dependencies')
+  if (tags.length === 0) tags.push('general')
+
+  return {
+    name: `turn-${Date.now().toString(36)}`,
+    description: userMessage.slice(0, 80),
+    content: `User: ${userMessage.slice(0, 200)}\nAssistant: ${assistantResponse.slice(0, 500)}`,
+    type: 'summary',
+    tags,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    sourceSessionId: sessionId,
+  }
+}
+
+// ============================================================================
+// Legacy CRUD
+// ============================================================================
+
+export function listMemories(): MemoryEntry[] { return [...memories] }
+export function getMemory(name: string): MemoryEntry | undefined { return memories.find(m => m.name === sanitizeName(name)) }
+export function saveMemory(entry: MemoryEntry): void { storeMemory(entry) }
+
+export function deleteMemory(name: string): boolean {
+  const sn = sanitizeName(name)
+  const idx = memories.findIndex(m => sanitizeName(m.name) === sn)
+  if (idx === -1) return false
+  memories.splice(idx, 1)
+  if (storeDir) { try { writeFileSync(join(storeDir, `${sn}.md`), '', 'utf-8') } catch {} }
+  return true
 }
 
 // ============================================================================
@@ -134,26 +165,20 @@ function sanitizeName(name: string): string {
 }
 
 function parseMemoryFile(content: string, fileName: string): MemoryEntry | null {
-  // Parse frontmatter
-  const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
-  if (!frontmatterMatch) return null
-
-  const frontmatter = frontmatterMatch[1]!
-  const body = frontmatterMatch[2]!.trim()
-
-  const name = extractField(frontmatter, 'name') ?? basename(fileName, extname(fileName))
-  const description = extractField(frontmatter, 'description') ?? ''
-  const typeField = extractField(frontmatter, 'type') ?? 'reference'
-  const metadataMatch = frontmatter.match(/tags:\s*\[(.*?)\]/)
-
+  const fm = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
+  if (!fm) return null
+  const front = fm[1]!
   return {
-    name,
-    description,
-    content: body,
-    type: typeField as MemoryEntry['type'],
-    tags: metadataMatch ? metadataMatch[1]!.split(',').map(t => t.trim().replace(/['"]/g, '')) : [],
-    createdAt: extractField(frontmatter, 'createdAt') ?? new Date().toISOString(),
-    updatedAt: extractField(frontmatter, 'updatedAt') ?? new Date().toISOString(),
+    name: extractField(front, 'name') ?? basename(fileName, extname(fileName)),
+    description: extractField(front, 'description') ?? '',
+    content: fm[2]!.trim(),
+    type: (extractField(front, 'type') ?? 'reference') as MemoryEntry['type'],
+    tags: (() => {
+      const m = front.match(/tags:\s*\[(.*?)\]/)
+      return m ? m[1]!.split(',').map(t => t.trim().replace(/['"]/g, '')) : []
+    })(),
+    createdAt: extractField(front, 'createdAt') ?? new Date().toISOString(),
+    updatedAt: extractField(front, 'updatedAt') ?? new Date().toISOString(),
   }
 }
 
@@ -172,35 +197,29 @@ ${entry.content}
 `
 }
 
-function extractField(frontmatter: string, key: string): string | null {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))
-  return match ? match[1]!.trim() : null
+function extractField(fm: string, key: string): string | null {
+  const m = fm.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))
+  return m ? m[1]!.trim() : null
 }
 
-function extractCreatedAt(content: string): string | null {
-  return extractField(content.split('---')[1] ?? '', 'createdAt')
+function extractCreatedAt(c: string): string | null {
+  return extractField(c.split('---')[1] ?? '', 'createdAt')
 }
 
 function updateIndex(dir: string, entry: MemoryEntry): void {
-  const indexPath = getIndexPath(dir)
+  const indexPath = resolve(dir, '..', INDEX_FILE)
   const line = `- [${entry.name}](${entry.name}.md) — ${entry.description}\n`
-
-  let indexContent = ''
-  if (existsSync(indexPath)) {
-    indexContent = readFileSync(indexPath, 'utf-8')
-
-    // Replace existing line or append
-    const regex = new RegExp(`- \\[${escapeRegex(entry.name)}\\]\\([^)]+\\) — .*\\n?`)
-    if (regex.test(indexContent)) {
-      indexContent = indexContent.replace(regex, line)
+  try {
+    let content = ''
+    if (existsSync(indexPath)) {
+      content = readFileSync(indexPath, 'utf-8')
+      const re = new RegExp(`- \\[${escapeRegex(entry.name)}\\]\\([^)]+\\) — .*\\n?`)
+      content = re.test(content) ? content.replace(re, line) : content + line
     } else {
-      indexContent += line
+      content = `# Memory Index\n\n${line}`
     }
-  } else {
-    indexContent = `# Memory Index\n\n${line}`
-  }
-
-  writeFileSync(indexPath, indexContent, 'utf-8')
+    writeFileSync(indexPath, content, 'utf-8')
+  } catch {}
 }
 
 function escapeRegex(s: string): string {

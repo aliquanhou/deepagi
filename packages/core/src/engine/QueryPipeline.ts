@@ -2,11 +2,7 @@
  * DeepAGI QueryPipeline
  *
  * Ported from Open-ClaudeCode's query.ts state machine.
- * while(true) + state = next loop with:
- * - 5-layer compression (Snip → Micro → Collapse → Auto → Reactive)
- * - API streaming via DeepSeekGateway
- * - Error recovery
- * - Tool_use detection / agent delegation
+ * Adds memory retrieval & injection for cross-session knowledge.
  */
 
 import type { SDKMessage, SDKAssistantMessage, SDKStreamEvent, ToolDef } from '../types/index.js'
@@ -16,6 +12,7 @@ import { microcompact } from '../compression/microcompact.js'
 import { contextCollapse } from '../compression/collapse.js'
 import { autoCompact } from '../compression/autocompact.js'
 import { reactiveCompact } from '../compression/reactiveCompact.js'
+import { searchMemories, formatMemoriesForPrompt } from '../memory/index.js'
 
 // ============================================================================
 // Types
@@ -41,11 +38,12 @@ export type PipelineConfig = {
   maxTurns?: number
   signal: AbortSignal
   model?: string
-  // Compression config
   maxMessagesBeforeCompact?: number
   snipKeepLast?: number
   autoCompactEnabled?: boolean
   collapseEnabled?: boolean
+  /** Enable memory retrieval from cross-session store */
+  memoryEnabled?: boolean
 }
 
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
@@ -63,13 +61,11 @@ export class QueryPipeline {
       snipKeepLast: 15,
       autoCompactEnabled: true,
       collapseEnabled: true,
+      memoryEnabled: true,
       ...config,
     }
   }
 
-  /**
-   * Run the query loop with compression + error recovery.
-   */
   async *run(params: {
     messages: SDKMessage[]
     turnCount: number
@@ -84,15 +80,31 @@ export class QueryPipeline {
       autoCompactApplied: false,
     }
 
+    // Memory retrieval phase: search cross-session memories once per pipeline run
+    let memoryContext = ''
+    if (this.config.memoryEnabled) {
+      const userMessages = params.messages
+        .filter(m => m.type === 'user')
+        .map(m => typeof m.message.content === 'string' ? m.message.content : '')
+        .join(' ')
+
+      if (userMessages.trim()) {
+        const memories = searchMemories(userMessages, 5)
+        memoryContext = formatMemoriesForPrompt(memories)
+      }
+    }
+
+    // Build system prompt with memory context
+    const baseSystemPrompt = this.config.systemPrompt
+    const fullSystemPrompt = memoryContext
+      ? baseSystemPrompt + `\n\n${memoryContext}`
+      : baseSystemPrompt
+
     while (true) {
       const { messages, turnCount } = state
-
-      // =====================================================================
-      // Stage 1: Compression pipeline (5 layers)
-      // =====================================================================
       let compressedMessages = messages
 
-      // Layer 1: Snip — truncate if too long
+      // Compression pipeline
       if (!state.snipApplied) {
         const snipResult = snipCompact(compressedMessages, this.config.snipKeepLast)
         if (snipResult.tokensFreed > 0) {
@@ -101,17 +113,14 @@ export class QueryPipeline {
         }
       }
 
-      // Layer 2: Microcompact — trim verbose tool results
       const microResult = microcompact(compressedMessages)
       compressedMessages = microResult.messages
 
-      // Layer 3: Context Collapse — fold distant segments
       if (this.config.collapseEnabled) {
         const collapseResult = contextCollapse(compressedMessages, true)
         compressedMessages = collapseResult.messages
       }
 
-      // Layer 4: AutoCompact — summarize oldest messages
       if (this.config.autoCompactEnabled && !state.autoCompactApplied) {
         const autoResult = await autoCompact(compressedMessages, true)
         if (autoResult.compacted) {
@@ -120,9 +129,7 @@ export class QueryPipeline {
         }
       }
 
-      // =====================================================================
-      // Stage 2: API call via DeepSeek
-      // =====================================================================
+      // API call
       const assistantMessages: SDKAssistantMessage[] = []
       let hasToolUse = false
       let lastStopReason: string | null = null
@@ -132,7 +139,7 @@ export class QueryPipeline {
         for await (const message of this.config.gateway.stream({
           messages: compressedMessages,
           tools: this.config.tools,
-          systemPrompt: this.config.systemPrompt,
+          systemPrompt: fullSystemPrompt,
           signal: this.config.signal,
           model: this.config.model,
         })) {
@@ -152,11 +159,8 @@ export class QueryPipeline {
         apiError = error instanceof Error ? error.message : String(error)
       }
 
-      // =====================================================================
-      // Stage 3: Error recovery
-      // =====================================================================
+      // Error recovery
       if (apiError) {
-        // Layer 5: ReactiveCompact — attempt recovery for prompt_too_long
         if (!state.hasAttemptedReactiveCompact) {
           const reactiveResult = await reactiveCompact(compressedMessages, apiError)
           if (reactiveResult.compacted) {
@@ -169,46 +173,25 @@ export class QueryPipeline {
             continue
           }
         }
-
-        // Yield error and terminate
         yield {
           type: 'assistant',
-          message: {
-            role: 'assistant',
-            content: [{ type: 'text', text: `API Error: ${apiError}` }],
-            stop_reason: 'error',
-          },
-          parent_tool_use_id: null,
-          uuid: crypto.randomUUID(),
-          session_id: crypto.randomUUID(),
+          message: { role: 'assistant', content: [{ type: 'text', text: `API Error: ${apiError}` }], stop_reason: 'error' },
+          parent_tool_use_id: null, uuid: crypto.randomUUID(), session_id: crypto.randomUUID(),
         }
         return { reason: 'model_error', error: apiError }
       }
 
-      // =====================================================================
-      // Stage 4: Terminal? No tool_use → done
-      // =====================================================================
-      if (!hasToolUse) {
-        return { reason: 'completed' }
-      }
+      if (!hasToolUse) return { reason: 'completed' }
 
-      // =====================================================================
-      // Stage 5: max_output_tokens recovery
-      // =====================================================================
+      // Max output tokens recovery
       const lastAssistant = assistantMessages.at(-1)
       if (lastAssistant?.error === 'max_output_tokens') {
         if (state.maxOutputTokensRecoveryCount < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT) {
           state = {
             ...state,
             messages: [
-              ...compressedMessages,
-              ...assistantMessages,
-              {
-                type: 'user',
-                message: { role: 'user', content: 'Continue from where you left off.' },
-                parent_tool_use_id: null,
-                uuid: crypto.randomUUID(),
-              },
+              ...compressedMessages, ...assistantMessages,
+              { type: 'user', message: { role: 'user', content: 'Continue from where you left off.' }, parent_tool_use_id: null, uuid: crypto.randomUUID() },
             ],
             transition: { reason: 'max_output_tokens_recovery', attempt: state.maxOutputTokensRecoveryCount + 1 },
             maxOutputTokensRecoveryCount: state.maxOutputTokensRecoveryCount + 1,
@@ -217,28 +200,17 @@ export class QueryPipeline {
         }
       }
 
-      // =====================================================================
-      // Stage 6: Max turns check
-      // =====================================================================
+      // Max turns check
       const nextTurnCount = turnCount + 1
       if (this.config.maxTurns && nextTurnCount > this.config.maxTurns) {
         yield {
           type: 'assistant',
-          message: {
-            role: 'assistant',
-            content: [{ type: 'text', text: `Reached maximum turns (${this.config.maxTurns})` }],
-            stop_reason: 'max_turns',
-          },
-          parent_tool_use_id: null,
-          uuid: crypto.randomUUID(),
-          session_id: crypto.randomUUID(),
+          message: { role: 'assistant', content: [{ type: 'text', text: `Reached maximum turns (${this.config.maxTurns})` }], stop_reason: 'max_turns' },
+          parent_tool_use_id: null, uuid: crypto.randomUUID(), session_id: crypto.randomUUID(),
         }
         return { reason: 'max_turns' }
       }
 
-      // =====================================================================
-      // Stage 7: Signal tool_use — caller (AgentEngine) handles execution
-      // =====================================================================
       return { reason: 'tool_use' }
     }
   }
